@@ -5,7 +5,9 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 )
 
 type SameFileError struct {
@@ -40,6 +42,15 @@ type AlreadyExistsError struct {
 
 func (e AlreadyExistsError) Error() string {
 	return fmt.Sprintf("`%s` already exists", e.Dst)
+}
+
+type MoveOntoSelfError struct {
+	Src string
+	Dst string
+}
+
+func (e MoveOntoSelfError) Error() string {
+	return fmt.Sprintf("Cannot move a directory `%s` into itself `%s` ", e.Src, e.Dst)
 }
 
 func samefile(src string, dst string) bool {
@@ -196,11 +207,14 @@ func Copy(src, dst string, followSymlinks bool) (string, error) {
 	return dst, nil
 }
 
+type CopyFunc func(string, string, bool) (string, error)
+type IgnoreFunc func(string, []os.FileInfo) []string
+
 type CopyTreeOptions struct {
 	Symlinks               bool
 	IgnoreDanglingSymlinks bool
-	CopyFunction           func(string, string, bool) (string, error)
-	Ignore                 func(string, []os.FileInfo) []string
+	CopyFunction           CopyFunc
+	Ignore                 IgnoreFunc
 }
 
 // Recursively copy a directory tree.
@@ -236,7 +250,8 @@ type CopyTreeOptions struct {
 // exists) can be used.
 func CopyTree(src, dst string, options *CopyTreeOptions) error {
 	if options == nil {
-		options = &CopyTreeOptions{Symlinks: false,
+		options = &CopyTreeOptions{
+			Symlinks:               false,
 			Ignore:                 nil,
 			CopyFunction:           Copy,
 			IgnoreDanglingSymlinks: false}
@@ -316,4 +331,141 @@ func CopyTree(src, dst string, options *CopyTreeOptions) error {
 		}
 	}
 	return nil
+}
+
+// Determines if a file represented
+// by `path` is a directory or not
+func isDirectory(path string) (bool, error) {
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+
+	return fileInfo.IsDir(), err
+}
+
+type MoveOptions struct {
+	CopyFunction CopyFunc
+}
+
+// Recursively move a file or directory to another location. this is similar to
+// the unix "mv" command. Return the file or directory's destination.
+//
+// If the destination is a directory or a symlink to a directory, the source is
+// moved inside the directory. The destination path must not exist.
+//
+// If the destination already exists but is not a directory, it may be overwritten
+// depending on os.Rename() semantics.
+//
+// If the destination is in our current file system, then rename() is used. Otherwise,
+// src is copied to the destination and then removed. Symlinks are recreated under the new
+// name if os.rename() fails because of cross filesystem renames.
+//
+// The optional `copy_function` argument is a callable the will be used to copy the source
+// or it will be delegated to `copytree`. By default copy2() is used, but any function
+// that supports the same signature (like copy()) can be used.
+//
+
+func Move(src, dst string, options *MoveOptions) (string, error) {
+	if options == nil {
+		options = &MoveOptions{
+			CopyFunction: Copy,
+		}
+	}
+	real_dst := dst
+
+	// dst might not exist so ignore any errors
+	// (matching Pythons os.path.isdir())
+	isDirDst, _ := isDirectory(dst)
+
+	if isDirDst {
+		if samefile(src, dst) {
+			// We might be on a case insentive file system,
+			// perform the rename anyway
+			return dst, os.Rename(src, dst)
+		}
+		real_dst = path.Join(dst, path.Base(src))
+		if _, err := os.Stat(real_dst); err == nil {
+			return "", &AlreadyExistsError{dst}
+		}
+	}
+	// If a rename works, do that
+	if err := os.Rename(src, real_dst); err == nil {
+		return real_dst, nil
+	}
+
+	srcStat, err := os.Lstat(src)
+	if err != nil {
+		return "", err
+	}
+
+	// If the source is a symlink then handle that
+	if IsSymlink(srcStat) {
+		linkto, err := os.Readlink(src)
+		if err != nil {
+			return "", err
+		}
+		err = os.Symlink(linkto, real_dst)
+		if err != nil {
+			return "", err
+		}
+		err = os.Remove(src)
+		if err != nil {
+			return "", err
+		}
+		return real_dst, nil
+	}
+
+	isSrcDir, _ := isDirectory(src)
+
+	if isSrcDir {
+		insrc, err := destinsrc(src, dst)
+		if err != nil {
+			return "", err
+		}
+		if insrc {
+			return "", &MoveOntoSelfError{src, dst}
+		}
+		// Skip the immutability checks for now
+		// These are hard in Golang
+		CopyTree(src, real_dst, &CopyTreeOptions{
+			Symlinks:               true,
+			IgnoreDanglingSymlinks: false,
+			Ignore:                 nil,
+			CopyFunction:           Copy,
+		})
+		os.RemoveAll(src)
+	} else {
+		_, err = options.CopyFunction(src, real_dst, true)
+		if err != nil {
+			return "", err
+		}
+		err = os.Remove(src)
+		if err != nil {
+			return "", err
+		}
+	}
+	return real_dst, nil
+
+}
+
+func destinsrc(src, dst string) (bool, error) {
+	var err error
+	sep := string(os.PathSeparator)
+
+	src, err = filepath.Abs(src)
+	if err != nil {
+		return false, err
+	}
+	dst, err = filepath.Abs(dst)
+	if err != nil {
+		return false, err
+	}
+	if !strings.HasSuffix(src, sep) {
+		src += sep
+	}
+	if !strings.HasSuffix(src, sep) {
+		dst += sep
+	}
+	return strings.HasPrefix(dst, src), nil
 }
